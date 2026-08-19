@@ -173,3 +173,21 @@ Overall, the LLM protocol outputs remain close to zero and are broadly consisten
 │   ├── final_report.pdf
 │   └── research_poster.pdf
 └── README.md
+```
+
+## Technologies
+
+- Python
+- NumPy
+- Pandas
+- Scikit-learn
+- Statsmodels
+- Large Language Models
+- Causal Inference
+- Statistical Simulation
+- In-Context Learning
+
+## Report and Poster
+
+- [Final Report](report/final_report.pdf)
+- [Research Poster](report/research_poster.pdf)
