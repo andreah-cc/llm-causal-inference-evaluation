@@ -1,16 +1,24 @@
-"""Augmented inverse-probability weighting (doubly robust) baseline."""
+"""Doubly robust AIPW estimator with several outcome-model choices."""
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression, Ridge
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
 
-from .propensity import estimate_propensity_logit, overlap_status
+from .compat import estimate_propensity_logit
 
 def baseline_aipw_dr(
     df: pd.DataFrame,
     clip: float = 1e-3,
-    outcome_model: str = "linear",   # "linear" or "ridge"
-    ridge_alpha: float = 1.0
+    outcome_model: str = "linear",   # "linear", "ridge", "rf", "hgb"
+    ridge_alpha: float = 1.0,
+    rf_n_estimators: int = 300,
+    rf_min_samples_leaf: int = 5,
+    rf_max_depth=None,
+    hgb_max_depth: int = 3,
+    hgb_learning_rate: float = 0.05,
+    hgb_max_iter: int = 400,
+    random_state: int = 0
 ):
     """
     Doubly Robust AIPW estimator for ATE.
@@ -29,73 +37,83 @@ def baseline_aipw_dr(
     se_hat  = sqrt(var(psi_i)/n)
     """
 
-    # --- reuse your propensity code (also drops missing rows) ---
-    d, x_cols, e_hat = estimate_propensity_logit(df, clip=clip)
+    d, x_cols, e_hat, ps_info = estimate_propensity_logit(df, clip=clip)
     A = d["A"].to_numpy(dtype=int)
     Y = d["Y"].to_numpy(dtype=float)
     n = d.shape[0]
-
-    # overlap diagnostics
-    status, e_min, e_max = overlap_status(e_hat)
+    # overlap diagnostics (already computed inside estimate_propensity_logit)
+    status = ps_info["overlap_status"]
+    e_min  = ps_info["e_min"]
+    e_max  = ps_info["e_max"]
 
     # choose outcome regressor
+    outcome_model = str(outcome_model).lower()
     if outcome_model == "ridge":
-        reg = lambda: Ridge(alpha=ridge_alpha)
+        def make_reg():
+            return Ridge(alpha=ridge_alpha)
+    elif outcome_model in {"rf", "random_forest"}:
+        def make_reg():
+            return RandomForestRegressor(
+                n_estimators=rf_n_estimators,
+                min_samples_leaf=rf_min_samples_leaf,
+                max_depth=rf_max_depth,
+                random_state=random_state
+            )
+    elif outcome_model in {"hgb", "hist_gb", "histgradientboosting"}:
+        def make_reg():
+            return HistGradientBoostingRegressor(
+                max_depth=hgb_max_depth,
+                learning_rate=hgb_learning_rate,
+                max_iter=hgb_max_iter,
+                random_state=random_state
+            )
     else:
-        reg = lambda: LinearRegression()
+        def make_reg():
+            return LinearRegression()
 
     # --- estimate mu0_hat, mu1_hat ---
     if len(x_cols) == 0:
-        # no covariates: fallback to group means (still valid as a baseline)
-        mu1 = float(np.mean(Y[A == 1])) if np.any(A == 1) else None
-        mu0 = float(np.mean(Y[A == 0])) if np.any(A == 0) else None
-        if mu1 is None or mu0 is None:
-            return {
-                "estimator_name": "aipw_dr",
-                "ate_hat": None,
-                "se_hat": None,
-                "ci_95": [None, None],
-                "n_used": int(n),
-                "p_covariates": 0,
-                "overlap_status": "violation",
-                "e_min": e_min,
-                "e_max": e_max,
-                "notes": "No treated or no control units after dropping missing rows."
-            }
-        mu1_hat = np.full(n, mu1, dtype=float)
-        mu0_hat = np.full(n, mu0, dtype=float)
+        return {
+            "estimator_name": "aipw_dr",
+            "ate_hat": None,
+            "se_hat": None,
+            "ci_95": [None, None],
+            "n_used": int(n),
+            "p_covariates": 0,
+            "overlap_status": "violation",
+            "e_min": float(e_min),
+            "e_max": float(e_max),
+            "notes": "AIPW/DR requires covariates X to fit mu1_hat(x), mu0_hat(x); no X-columns found."
+        }
+    X = d[x_cols].to_numpy(dtype=float)
 
-    else:
-        X = d[x_cols].to_numpy(dtype=float)
+    idx1 = (A == 1)
+    idx0 = (A == 0)
 
-        idx1 = (A == 1)
-        idx0 = (A == 0)
+    if not np.any(idx1) or not np.any(idx0):
+        return {
+            "estimator_name": "aipw_dr",
+            "ate_hat": None,
+            "se_hat": None,
+            "ci_95": [None, None],
+            "n_used": int(n),
+            "p_covariates": int(len(x_cols)),
+            "overlap_status": "violation",
+            "e_min": float(e_min),
+            "e_max": float(e_max),
+            "notes": "No treated or no control units after dropping missing rows."
+        }
 
-        if not np.any(idx1) or not np.any(idx0):
-            return {
-                "estimator_name": "aipw_dr",
-                "ate_hat": None,
-                "se_hat": None,
-                "ci_95": [None, None],
-                "n_used": int(n),
-                "p_covariates": int(len(x_cols)),
-                "overlap_status": "violation",
-                "e_min": e_min,
-                "e_max": e_max,
-                "notes": "No treated or no control units after dropping missing rows."
-            }
+    # Fit separate outcome models
+    m1 = make_reg()
+    m0 = make_reg()
+    m1.fit(X[idx1], Y[idx1])
+    m0.fit(X[idx0], Y[idx0])
 
-        # Fit separate outcome models
-        m1 = reg()
-        m0 = reg()
-        m1.fit(X[idx1], Y[idx1])
-        m0.fit(X[idx0], Y[idx0])
-
-        mu1_hat = m1.predict(X).astype(float)
-        mu0_hat = m0.predict(X).astype(float)
+    mu1_hat = m1.predict(X).astype(float)
+    mu0_hat = m0.predict(X).astype(float)
 
     # --- AIPW / DR score and estimate ---
-    # (e_hat is already clipped in estimate_propensity_logit)
     psi = (mu1_hat - mu0_hat) + (A * (Y - mu1_hat) / e_hat) - ((1 - A) * (Y - mu0_hat) / (1 - e_hat))
 
     ate_hat = float(np.mean(psi))
@@ -104,6 +122,12 @@ def baseline_aipw_dr(
 
     notes = []
     notes.append(f"Outcome model: {outcome_model}")
+    if outcome_model == "ridge":
+        notes.append(f"ridge_alpha={ridge_alpha}")
+    if outcome_model in {"rf", "random_forest"}:
+        notes.append(f"rf_n_estimators={rf_n_estimators}, rf_min_samples_leaf={rf_min_samples_leaf}, rf_max_depth={rf_max_depth}")
+    if outcome_model in {"hgb", "hist_gb", "histgradientboosting"}:
+        notes.append(f"hgb_max_depth={hgb_max_depth}, hgb_learning_rate={hgb_learning_rate}, hgb_max_iter={hgb_max_iter}")
     if status != "ok":
         notes.append(f"Overlap {status}: e_hat in [{e_min:.4g}, {e_max:.4g}] (weights may be unstable).")
 

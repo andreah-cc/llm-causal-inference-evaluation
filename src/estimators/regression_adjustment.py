@@ -1,31 +1,39 @@
-"""Regression-adjustment plug-in baseline."""
+"""Regression-adjustment plug-in estimator (OLS or neural-network outcome model)."""
 
 import numpy as np
 import statsmodels.api as sm
+from sklearn.neural_network import MLPRegressor
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from .propensity import estimate_propensity_logit, overlap_status
+from .compat import estimate_propensity_logit, overlap_status
+from .bootstrap import _bootstrap_ate
 
-def baseline_ra_plugin(
+def ra_plugin(
     df,
     robust=True,
     ci_level=0.95,
-    clip=1e-3
+    clip=1e-3,
+    use_nn=False,
+    hidden_layer_sizes=(64, 64),
+    alpha=1e-4,
+    max_iter=2000,
+    early_stopping=True,
+    B=300,
+    seed=123
 ):
 
-    # propensity score and overlap check
     d, x_cols, e_hat = estimate_propensity_logit(df, clip=clip)
 
-    # extract treatment and outcome
     A = d["A"].to_numpy(dtype=int)
     Y = d["Y"].to_numpy(dtype=float)
     n = d.shape[0]
 
     status, e_min, e_max = overlap_status(e_hat)
 
-    # when sample size is samll, return empty
     if n < 5:
         return {
-            "estimator_name": "ra_plugin",
+            "estimator_name": "ra_plugin_nn" if use_nn else "ra_plugin_ols",
             "ate_hat": None,
             "se_hat": None,
             "ci_95": [None, None],
@@ -34,14 +42,14 @@ def baseline_ra_plugin(
             "overlap_status": "violation",
             "e_min": e_min,
             "e_max": e_max,
-            "notes": "Too few observations after preprocessing."
+            "notes": "Too few observations."
         }
 
-    # no covariates
+    # CASE 1: No covariates
     if len(x_cols) == 0:
         if not np.any(A == 1) or not np.any(A == 0):
             return {
-                "estimator_name": "ra_plugin",
+                "estimator_name": "diff_in_means",
                 "ate_hat": None,
                 "se_hat": None,
                 "ci_95": [None, None],
@@ -55,73 +63,180 @@ def baseline_ra_plugin(
 
         mu1 = float(np.mean(Y[A == 1]))
         mu0 = float(np.mean(Y[A == 0]))
+        ate_hat = mu1 - mu0
 
-        mu1_hat = np.full(n, mu1)
-        mu0_hat = np.full(n, mu0)
+        # bootstrap SE / CI
+        def ate_fn_no_x(d_boot):
+            Ab = d_boot["A"].to_numpy(dtype=int)
+            Yb = d_boot["Y"].to_numpy(dtype=float)
+
+            if not np.any(Ab == 1) or not np.any(Ab == 0):
+                return np.nan
+
+            mu1b = np.mean(Yb[Ab == 1])
+            mu0b = np.mean(Yb[Ab == 0])
+            return float(mu1b - mu0b)
+
+        se_hat, ci_95 = _bootstrap_ate(d, ate_fn_no_x, B=B, seed=seed, ci_level=ci_level)
+
+        notes = [
+            "Difference-in-means estimator (no covariates).",
+            f"Bootstrap SE/CI with B={B}."
+        ]
+        if status != "ok":
+            notes.append(f"Overlap {status}: e_hat in [{e_min:.4g}, {e_max:.4g}].")
+
+        return {
+            "estimator_name": "diff_in_means",
+            "ate_hat": float(ate_hat),
+            "se_hat": float(se_hat),
+            "ci_95": [float(ci_95[0]), float(ci_95[1])],
+            "n_used": int(n),
+            "p_covariates": 0,
+            "overlap_status": status,
+            "e_min": e_min,
+            "e_max": e_max,
+            "notes": " ".join(notes)
+        }
+
+    # CASE 2: Have covariates
+    X = d[x_cols].to_numpy(dtype=float)
+
+    # METHOD A: OLS RA baseline
+    if not use_nn:
+        # Fit on original sample
+        Z = sm.add_constant(np.column_stack([A, X]), has_constant="add")
+        fit = sm.OLS(Y, Z).fit()
+
+        Z1 = Z.copy()
+        Z1[:, 1] = 1
+        Z0 = Z.copy()
+        Z0[:, 1] = 0
+
+        mu1_hat = fit.predict(Z1)
+        mu0_hat = fit.predict(Z0)
 
         d_hat = mu1_hat - mu0_hat
         ate_hat = float(np.mean(d_hat))
-        se_hat = float(np.sqrt(np.var(d_hat, ddof=1) / n)) if n > 1 else None
 
-    # with covariates
-    else:
-        X = d[x_cols].to_numpy(dtype=float)
+        # bootstrap SE / CI for OLS plug-in ATE
+        def ate_fn_ols(d_boot):
+            Ab = d_boot["A"].to_numpy(dtype=int)
+            Yb = d_boot["Y"].to_numpy(dtype=float)
+            Xb = d_boot[x_cols].to_numpy(dtype=float)
 
-        # construct regression design matrix: [1, A, X]
-        X_design = sm.add_constant(
-            np.column_stack([A, X]),
-            has_constant="add"
-        )
+            Zb = sm.add_constant(np.column_stack([Ab, Xb]), has_constant="add")
+            fit_b = sm.OLS(Yb, Zb).fit()
 
-        fit = sm.OLS(Y, X_design).fit()
+            Z1b = Zb.copy()
+            Z1b[:, 1] = 1
+            Z0b = Zb.copy()
+            Z0b[:, 1] = 0
+
+            mu1b = fit_b.predict(Z1b)
+            mu0b = fit_b.predict(Z0b)
+
+            return float(np.mean(mu1b - mu0b))
+
+        se_hat, ci_95 = _bootstrap_ate(d, ate_fn_ols, B=B, seed=seed, ci_level=ci_level)
+
+        notes = [
+            "Outcome regression plug-in estimator (OLS).",
+            "ATE computed as mean(m_hat(1,X) - m_hat(0,X)).",
+            f"Bootstrap SE/CI with B={B}.",
+            "OLS outcome model: Y ~ A + X."
+        ]
         if robust:
-            fit = fit.get_robustcov_results(cov_type="HC1")
+            notes.append("Robust option not used for SE/CI because inference is bootstrap-based.")
+        if status != "ok":
+            notes.append(f"Overlap {status}: e_hat in [{e_min:.4g}, {e_max:.4g}].")
 
-        X1 = X_design.copy()
-        X1[:, 1] = 1
+        return {
+            "estimator_name": "ra_plugin_ols",
+            "ate_hat": float(ate_hat),
+            "se_hat": float(se_hat),
+            "ci_95": [float(ci_95[0]), float(ci_95[1])],
+            "n_used": int(n),
+            "p_covariates": int(len(x_cols)),
+            "overlap_status": status,
+            "e_min": e_min,
+            "e_max": e_max,
+            "notes": " ".join(notes)
+        }
 
-        X0 = X_design.copy()
-        X0[:, 1] = 0
+    # METHOD B: NN baseline
+    W = np.column_stack([A, X])
 
-        mu1_hat = fit.predict(X1)
-        mu0_hat = fit.predict(X0)
+    model = Pipeline(steps=[
+        ("scaler", StandardScaler()),
+        ("mlp", MLPRegressor(
+            hidden_layer_sizes=hidden_layer_sizes,
+            alpha=alpha,
+            max_iter=max_iter,
+            early_stopping=early_stopping,
+            random_state=seed
+        ))
+    ])
 
-        d_hat = mu1_hat - mu0_hat
-        ate_hat = float(np.mean(d_hat))
+    model.fit(W, Y)
 
-        # use delta method for SE
-        covb = np.asarray(fit.cov_params())
-        diff_design = (X1 - X0)
-        grad = diff_design.mean(axis=0).reshape(-1, 1)
+    W1 = W.copy()
+    W1[:, 0] = 1
+    W0 = W.copy()
+    W0[:, 0] = 0
 
-        var_ate = float(grad.T @ covb @ grad)
-        se_hat = np.sqrt(var_ate) if np.isfinite(var_ate) and var_ate >= 0 else None
+    mu1_hat = model.predict(W1)
+    mu0_hat = model.predict(W0)
 
-    # CI
-    alpha = 1 - ci_level
-    z = 1.96
-    if abs(ci_level - 0.95) > 1e-12:
-        from scipy.stats import norm
-        z = float(norm.ppf(1 - alpha / 2))
+    d_hat = mu1_hat - mu0_hat
+    ate_hat = float(np.mean(d_hat))
 
-    ci_95 = [ate_hat - z * se_hat, ate_hat + z * se_hat] if se_hat is not None else [None, None]
+    def ate_fn(d_boot):
+        Ab = d_boot["A"].to_numpy(dtype=int)
+        Yb = d_boot["Y"].to_numpy(dtype=float)
+        Xb = d_boot[x_cols].to_numpy(dtype=float)
 
-    # diagnostics
-    notes = []
-    if robust:
-        notes.append("HC1 robust SE.")
+        Wb = np.column_stack([Ab, Xb])
+
+        mb = Pipeline(steps=[
+            ("scaler", StandardScaler()),
+            ("mlp", MLPRegressor(
+                hidden_layer_sizes=hidden_layer_sizes,
+                alpha=alpha,
+                max_iter=max_iter,
+                early_stopping=early_stopping,
+                random_state=seed
+            ))
+        ])
+        mb.fit(Wb, Yb)
+
+        W1b = Wb.copy()
+        W1b[:, 0] = 1
+        W0b = Wb.copy()
+        W0b[:, 0] = 0
+
+        return float(np.mean(mb.predict(W1b) - mb.predict(W0b)))
+
+    se_hat, ci_95 = _bootstrap_ate(d, ate_fn, B=B, seed=seed, ci_level=ci_level)
+
+    notes = [
+        "Outcome regression plug-in estimator (NN).",
+        "Same plug-in formula: mean(m_hat(1,X) - m_hat(0,X)).",
+        f"Bootstrap SE/CI with B={B}.",
+        f"MLP hidden_layer_sizes={hidden_layer_sizes}, alpha={alpha}, max_iter={max_iter}, early_stopping={early_stopping}."
+    ]
     if status != "ok":
         notes.append(f"Overlap {status}: e_hat in [{e_min:.4g}, {e_max:.4g}].")
 
     return {
-        "estimator_name": "ra_plugin",
-        "ate_hat": ate_hat,
-        "se_hat": se_hat,
-        "ci_95": [float(ci_95[0]), float(ci_95[1])] if se_hat is not None else ci_95,
+        "estimator_name": "ra_plugin_nn",
+        "ate_hat": float(ate_hat),
+        "se_hat": float(se_hat),
+        "ci_95": [float(ci_95[0]), float(ci_95[1])],
         "n_used": int(n),
         "p_covariates": int(len(x_cols)),
         "overlap_status": status,
         "e_min": e_min,
         "e_max": e_max,
-        "notes": " ".join(notes) if notes else None
+        "notes": " ".join(notes)
     }

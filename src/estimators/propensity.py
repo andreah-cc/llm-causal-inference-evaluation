@@ -1,52 +1,72 @@
-"""Propensity-score estimation and overlap diagnostics."""
+"""Propensity-score estimation (logistic regression, random forest, or MLP)."""
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-def _prep_ps_rows(df: pd.DataFrame):
-    if not {"Y", "A"}.issubset(df.columns):
-        raise ValueError("df must contain columns 'Y' and 'A'.")
+from .preprocessing import _prep_ps_rows
 
-    x_cols = [c for c in df.columns if c.startswith("X")]
-    use_cols = ["Y", "A"] + x_cols
-    d = df[use_cols].copy()
-
-    d["Y"] = pd.to_numeric(d["Y"], errors="coerce")
-    d["A"] = pd.to_numeric(d["A"], errors="coerce").round()
-
-    for c in x_cols:
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-
-    d = d.dropna()
-    if d.shape[0] < 5:
-        raise ValueError("Not enough complete rows after dropping missing values.")
-
-    d["A"] = d["A"].astype(int).clip(0, 1)
-    return d, x_cols
-
-def estimate_propensity_logit(df: pd.DataFrame, clip: float = 1e-3):
+def fit_propensity_score(
+    df: pd.DataFrame,
+    method: str = "logit",
+    random_state: int = 0,
+    rf_n_estimators: int = 300,
+    rf_max_depth=None,
+    rf_min_samples_leaf: int = 5,
+    nn_hidden_layer_sizes=(64, 32)
+):
     d, x_cols = _prep_ps_rows(df)
-    n = d.shape[0]
+    A = d["A"].to_numpy(dtype=int)
 
     if len(x_cols) == 0:
-        e_hat = np.full(n, float(d["A"].mean()))
+        raw_e_hat = np.full(len(d), float(A.mean()))
+        method_used = "constant"
     else:
         X = d[x_cols].to_numpy(dtype=float)
-        A = d["A"].to_numpy(dtype=int)
+        method_used = method.lower()
 
-        model = LogisticRegression(solver="liblinear", max_iter=2000)
+        if method_used == "logit":
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("logit", LogisticRegression(
+                    solver="liblinear",
+                    max_iter=2000,
+                    random_state=random_state
+                ))
+            ])
+
+        elif method_used in {"rf", "random_forest"}:
+            model = RandomForestClassifier(
+                n_estimators=rf_n_estimators,
+                max_depth=rf_max_depth,
+                min_samples_leaf=rf_min_samples_leaf,
+                random_state=random_state
+            )
+
+        elif method_used in {"nn", "mlp", "neural_net", "neural_network"}:
+            model = Pipeline([
+                ("scaler", StandardScaler()),
+                ("mlp", MLPClassifier(
+                    hidden_layer_sizes=nn_hidden_layer_sizes
+                ))
+            ])
+
+        else:
+            raise ValueError("method must be one of: 'logit', 'rf', 'nn'.")
+
         model.fit(X, A)
-        e_hat = model.predict_proba(X)[:, 1]
+        raw_e_hat = model.predict_proba(X)[:, 1].astype(float)
 
-    e_hat = np.clip(e_hat, clip, 1 - clip)
-    return d, x_cols, e_hat
-
-def overlap_status(e_hat: np.ndarray, warn=0.01, viol=0.001):
-    e_min = float(np.min(e_hat)) if len(e_hat) else np.nan
-    e_max = float(np.max(e_hat)) if len(e_hat) else np.nan
-    if e_min <= viol or e_max >= 1 - viol:
-        return "violation", e_min, e_max
-    if e_min <= warn or e_max >= 1 - warn:
-        return "warning", e_min, e_max
-    return "ok", e_min, e_max
+    return {
+        "data": d,
+        "x_cols": x_cols,
+        "method": method_used,
+        "raw_e_hat": raw_e_hat,
+        "e_hat": raw_e_hat.copy(),
+        "n_used": int(len(d)),
+        "p_covariates": int(len(x_cols))
+    }
