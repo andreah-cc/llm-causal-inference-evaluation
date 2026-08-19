@@ -1,114 +1,133 @@
 # Can LLMs Do Causal Inference?
 
+Evaluating large language models as protocol-conditioned causal estimators using in-context learning, simulation benchmarks, classical causal methods, and a real-world PSID application.
+
 ## Overview
 
-This project evaluates whether large language models (LLMs) can estimate causal effects using in-context learning (ICL).
+This project investigates whether a general-purpose pretrained large language model (LLM), without fine-tuning, can estimate the Average Treatment Effect (ATE) from observational data.
 
-We investigate whether a general-purpose pretrained LLM, without fine-tuning, can produce accurate and reliable Average Treatment Effect (ATE) estimates under different causal scenarios.
+Rather than asking the LLM to infer causality directly from raw data, we design **method-inducing in-context learning (ICL) protocols** that provide estimator-specific summaries and instructions.
 
-The framework is evaluated using:
-- Synthetic datasets with known ground truth
-- Classical causal inference baselines
-- A real-world PSID observational data case study
+The framework combines:
 
+- 8 simulation engines with known ground-truth ATEs
+- 4 method-inducing ICL protocols
+- Classical causal inference benchmarks
+- Bias, RMSE, coverage, and uncertainty calibration
+- A real-world Panel Study of Income Dynamics (PSID) case study
 
 ## Research Questions
 
-This project investigates:
-
 1. Can ICL-prompted LLMs accurately estimate ATE?
-2. How robust are LLM estimates under:
-   - nonlinear relationships
-   - heterogeneous treatment effects
-   - weak overlap
-   - missing data
-3. How do LLM estimates compare with classical causal estimators?
-
+2. How robust are LLM estimates under nonlinear confounding, heterogeneous treatment effects, weak overlap, missingness, and noisy data?
+3. How well calibrated are LLM-reported confidence intervals?
+4. How do LLM estimates compare with classical causal estimators?
+5. Do the same protocol designs produce reasonable conclusions on real observational data?
 
 ## Methodology
 
 ### Simulation Benchmark
 
-We generate datasets with controlled data-generating processes (DGPs), including:
+Eight simulation engines are used to stress-test different causal challenges:
 
-- Linear treatment and outcome models
-- Nonlinear relationships
-- Treatment effect heterogeneity
-- Missingness mechanisms
-- Heavy-tailed noise
+| Engine | Main Challenge |
+|---|---|
+| 1 | Linear confounding with constant treatment effect |
+| 2 | Nonlinear outcome model |
+| 3 | Heterogeneous treatment effects and interactions |
+| 4 | High-dimensional sparse confounding |
+| 5 | Weak overlap / near-positivity violations |
+| 6 | Nonlinear treatment assignment and confounding |
+| 7 | Missing outcomes under MCAR / MAR |
+| 8 | Measurement error and heavy-tailed noise |
 
+Each simulated setting has a known ground-truth ATE, allowing direct evaluation of estimation error and confidence interval coverage.
 
-### Causal Estimation Methods
+### Method-Inducing ICL Protocols
 
-LLM-based estimates are compared with:
+The LLM is evaluated under structured protocols designed to induce specific causal estimators:
 
+| Protocol | Target Method | Input Representation |
+|---|---|---|
+| A | Difference-in-means | Treated/control summary statistics |
+| B1 | Regression adjustment | Compact microdata |
+| B2 | Regression adjustment | Compressed regression output |
+| C | Propensity-score stratification | Propensity-score bin summaries |
+| D | AIPW / Doubly robust | Precomputed nuisance quantities |
+
+The goal is to evaluate the LLM as a **constrained estimator interface**, rather than as an unrestricted causal-reasoning system.
+
+### Classical Benchmarks
+
+LLM-based estimates are compared with classical methods including:
+
+- Difference-in-means
 - Regression adjustment
+- Propensity-score stratification
 - Inverse Probability Weighting (IPW)
-- Augmented IPW (AIPW)
-- Doubly Robust estimators
-
+- Augmented IPW / Doubly Robust estimation
 
 ## Evaluation Metrics
 
 Performance is evaluated using:
 
 - Bias
+- Absolute bias
 - Root Mean Squared Error (RMSE)
-- Confidence interval coverage
-- Stability across prompts
+- Empirical 95% confidence interval coverage
+- Average confidence interval width
+- Reported vs empirical uncertainty calibration
+- Stability across simulation settings
 
+## Key Results
 
-## Real-world Application
+### Structured ICL improves over raw-data prompting
 
-A PSID observational data case study is conducted to compare LLM-based causal estimates with traditional causal inference methods.
+![Engine 1 method comparison](results/figures/engine1_comparison.png)
 
+In the simplest linear-confounding setting, the method-inducing Protocol D substantially improves RMSE and absolute bias relative to raw-data prompting while maintaining strong empirical coverage.
 
-## Technologies
+### Uncertainty calibration
 
-- Python
-- NumPy
-- Pandas
-- Scikit-learn
-- Large Language Models
-- Causal Inference
-- Statistical Simulation
+![Uncertainty calibration](results/figures/uncertainty_calibration.png)
 
+The raw-data baseline tends to under-report uncertainty, while Protocol D is more conservative and better aligned with empirical variation.
 
-## Results
+### LLM vs. classical estimators across simulation settings
 
-The evaluation framework compares LLM-based causal estimates with classical causal estimators across eight simulation engines with known ground-truth Average Treatment Effects (ATEs).
+![Across-engine bias comparison](results/figures/across_engine_bias.png)
 
-The main findings are:
+Across the simulation benchmark, the LLM performs competitively in several low-effect settings. However, larger true treatment effects often produce systematic underestimation.
 
-- Method-inducing in-context learning (ICL) substantially improves LLM estimation relative to raw-data prompting.
-- In low-effect settings, the structured LLM protocols achieve accuracy comparable to classical estimators such as regression adjustment and AIPW.
-- As the true treatment effect increases, the LLM tends to exhibit increasing negative bias and underestimation.
-- The LLM generally reports wider confidence intervals than classical estimators, resulting in conservative uncertainty quantification and frequent over-coverage.
-- In the nonlinear-confounding setting represented by Engine 6, the structured LLM protocol performs particularly well, producing lower bias and substantially better coverage than the classical benchmark used in the study.
+Engine 6 is a notable exception: under nonlinear treatment assignment and nonlinear confounding, the structured LLM protocol achieves lower bias and stronger empirical coverage than the classical benchmark used in the study.
 
-The complete simulation summary is available in:
+### Main Findings
+
+- Method-inducing ICL substantially improves estimation relative to raw-data prompting.
+- In low-effect settings, structured LLM protocols can achieve accuracy comparable to classical estimators.
+- Larger true treatment effects reveal a tendency toward negative bias and shrinkage toward zero.
+- LLM confidence intervals are generally wider than classical intervals, leading to conservative uncertainty quantification and frequent over-coverage.
+- Structured prompting appears particularly useful in some difficult nonlinear settings.
+
+The complete simulation summary is available at:
 
 `results/llm_evaluation_protocol_results.xlsx`
 
-For the full methodology, figures, and discussion, see:
-
-`report/final_report.pdf`
-
 ## PSID Real-World Case Study
 
-The project also applies the same causal-inference framework to the **Panel Study of Income Dynamics (PSID)**.
+The framework is also applied to the **Panel Study of Income Dynamics (PSID)**.
 
-The empirical question is whether participation in job training, vocational training, or related certification in **2013** affects long-run labor income measured in the **2023 PSID wave**.
+The empirical question is whether participation in job training, vocational training, or related certification in **2013** is associated with long-run labor income measured in the **2023 PSID wave**.
 
 The analysis uses:
 
-- pre-treatment covariates measured mainly in **2011**
-- treatment measured in **2013**
+- Pre-treatment covariates measured mainly in **2011**
+- Treatment measured in **2013**
 - Reference Person labor income for calendar year **2022**, reported in the **2023 wave**
 
 The final cleaned sample contains **6,096 observations**, including **4,240 treated** and **1,856 control** units.
 
-### Classical estimates
+### Classical Estimates
 
 | Estimator | ATE | SE | 95% CI |
 |---|---:|---:|---:|
@@ -117,9 +136,11 @@ The final cleaned sample contains **6,096 observations**, including **4,240 trea
 | PS stratification | 0.0390 | 0.0482 | [-0.0556, 0.1336] |
 | AIPW / Doubly robust | 0.0339 | 0.0438 | [-0.0520, 0.1197] |
 
-All classical 95% confidence intervals include zero, so the analysis does not provide statistically significant evidence of a nonzero long-run treatment effect under the study's specification.
+All classical 95% confidence intervals include zero, so the analysis does not provide statistically significant evidence of a nonzero long-run treatment effect under the study specification.
 
-### LLM protocol results
+### LLM Protocol Results
+
+![PSID LLM protocol comparison](results/figures/psid_llm_protocols.png)
 
 Repeated LLM runs also produce protocol-level mean estimates close to zero:
 
@@ -132,6 +153,23 @@ Repeated LLM runs also produce protocol-level mean estimates close to zero:
 
 Protocol D produces the widest intervals and therefore the most conservative uncertainty reporting among the four LLM protocols.
 
-The PSID application is intended as a real-world validation of the simulation findings. Because the true causal effect is unknown in observational data, the analysis focuses on overlap, agreement with classical estimators, and whether the LLM produces appropriately cautious conclusions.
+Overall, the LLM protocol outputs remain close to zero and are broadly consistent with the classical analysis, while still showing noticeable run-to-run variability.
 
-> Note: individual-level PSID microdata are not included in this repository. See `data/README.md` for the data description and reconstruction notes.
+> Individual-level PSID microdata are not included in this repository. See `data/README.md` for data description and reconstruction notes.
+
+## Repository Structure
+
+```text
+.
+├── notebooks/
+├── src/
+├── data/
+│   ├── simulated/
+│   └── README.md
+├── results/
+│   ├── figures/
+│   └── llm_evaluation_protocol_results.xlsx
+├── report/
+│   ├── final_report.pdf
+│   └── research_poster.pdf
+└── README.md
